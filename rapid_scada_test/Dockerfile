@@ -10,7 +10,8 @@ RUN apt-get update \
     && /opt/scada/make_executable.sh \
     && mv /opt/scada /opt/rapidscada-seed
 
-COPY run.sh starter-mimic.mim /usr/local/share/rapid-scada/
+COPY run.sh /usr/local/bin/rapid-scada-run
+COPY starter-mimic.mim /usr/local/share/rapid-scada/starter-mimic.mim
 RUN chmod +x /usr/local/bin/rapid-scada-run
 
 CMD ["/usr/local/bin/rapid-scada-run"]
