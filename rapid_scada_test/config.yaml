@@ -1,6 +1,6 @@
 name: "Rapid SCADA Test"
 description: "Isolated Rapid SCADA 6.4.7 evaluation instance"
-version: "6.4.7-2"
+version: "6.4.7-4"
 slug: "rapid_scada_test"
 webui: "http://[HOST]:[PORT:10008]"
 panel_icon: mdi:chart-timeline-variant-shimmer
