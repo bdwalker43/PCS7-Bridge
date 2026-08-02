@@ -1,6 +1,5 @@
 name: "FUXA Upstream Test"
 description: "Official FUXA 1.2.11 test instance for safe migration"
-image: "frangoteam/fuxa"
 version: "1.2.11"
 slug: "fuxa_upstream_test"
 webui: "http://[HOST]:[PORT:1882]/home"
@@ -13,19 +12,6 @@ schema: {}
 init: false
 arch:
   - amd64
-map:
-  - type: app_config
-    read_only: false
-    path: /usr/src/app/FUXA/server/_appdata
-  - type: app_config
-    read_only: false
-    path: /usr/src/app/FUXA/server/_db
-  - type: app_config
-    read_only: false
-    path: /usr/src/app/FUXA/server/_images
-  - type: app_config
-    read_only: false
-    path: /usr/src/app/FUXA/server/_logs
 startup: services
 ports:
   1881/tcp: 1882
