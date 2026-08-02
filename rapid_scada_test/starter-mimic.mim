@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Mimic editorVersion="6.0.2.1">
+  <Document>
+    <Size>
+      <Width>1280</Width>
+      <Height>720</Height>
+    </Size>
+  </Document>
+  <Components>
+    <Text>
+      <ID>1</ID>
+      <Name>Title</Name>
+      <Enabled>True</Enabled>
+      <Visible>True</Visible>
+      <Location><X>42</X><Y>28</Y></Location>
+      <Size><Width>760</Width><Height>52</Height></Size>
+      <Text>T3000-STYLE HVAC CONTROL — RAPID SCADA TEST</Text>
+    </Text>
+    <Panel>
+      <ID>2</ID>
+      <Name>AirHandler</Name>
+      <Enabled>True</Enabled>
+      <Visible>True</Visible>
+      <Location><X>42</X><Y>118</Y></Location>
+      <Size><Width>500</Width><Height>420</Height></Size>
+      <Components>
+        <Text>
+          <ID>3</ID><Name>Heading</Name><Enabled>True</Enabled><Visible>True</Visible>
+          <Location><X>20</X><Y>18</Y></Location><Size><Width>360</Width><Height>32</Height></Size>
+          <Text>AIR HANDLER 01</Text>
+        </Text>
+        <Text>
+          <ID>4</ID><Name>Mode</Name><Enabled>True</Enabled><Visible>True</Visible>
+          <Location><X>20</X><Y>82</Y></Location><Size><Width>430</Width><Height>28</Height></Size>
+          <Text>MODE: AUTO     COMMAND: STOPPED</Text>
+        </Text>
+        <Text>
+          <ID>5</ID><Name>Setpoint</Name><Enabled>True</Enabled><Visible>True</Visible>
+          <Location><X>20</X><Y>142</Y></Location><Size><Width>430</Width><Height>28</Height></Size>
+          <Text>SUPPLY AIR SETPOINT: 55.0 F</Text>
+        </Text>
+        <Text>
+          <ID>6</ID><Name>Temperatures</Name><Enabled>True</Enabled><Visible>True</Visible>
+          <Location><X>20</X><Y>202</Y></Location><Size><Width>430</Width><Height>28</Height></Size>
+          <Text>SUPPLY: --.- F     RETURN: --.- F</Text>
+        </Text>
+        <Text>
+          <ID>7</ID><Name>Alarm</Name><Enabled>True</Enabled><Visible>True</Visible>
+          <Location><X>20</X><Y>322</Y></Location><Size><Width>430</Width><Height>28</Height></Size>
+          <Text>ALARM STATUS: NORMAL</Text>
+        </Text>
+      </Components>
+    </Panel>
+    <Panel>
+      <ID>8</ID>
+      <Name>Notes</Name>
+      <Enabled>True</Enabled>
+      <Visible>True</Visible>
+      <Location><X>590</X><Y>118</Y></Location>
+      <Size><Width>570</Width><Height>420</Height></Size>
+      <Components>
+        <Text>
+          <ID>9</ID><Name>Heading</Name><Enabled>True</Enabled><Visible>True</Visible>
+          <Location><X>20</X><Y>18</Y></Location><Size><Width>480</Width><Height>32</Height></Size>
+          <Text>EDITOR SANDBOX</Text>
+        </Text>
+        <Text>
+          <ID>10</ID><Name>Instructions</Name><Enabled>True</Enabled><Visible>True</Visible>
+          <Location><X>20</X><Y>82</Y></Location><Size><Width>500</Width><Height>110</Height></Size>
+          <Text>Move, resize, rename, or delete these objects. Add components from the left panel. This screen has no real bindings or commands.</Text>
+        </Text>
+      </Components>
+    </Panel>
+  </Components>
+</Mimic>

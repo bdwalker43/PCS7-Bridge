@@ -12,6 +12,10 @@ fi
 
 mkdir -p "$ROOT/logs"
 
+if [ ! -f "$ROOT/Views/HelloWorld/T3000-Starter.mim" ]; then
+  cp /usr/local/share/rapid-scada/starter-mimic.mim "$ROOT/Views/HelloWorld/T3000-Starter.mim"
+fi
+
 shutdown() {
   kill "$SERVER_PID" "$COMM_PID" "$AGENT_PID" 2>/dev/null || true
 }
