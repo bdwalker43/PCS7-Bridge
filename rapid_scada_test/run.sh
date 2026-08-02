@@ -11,6 +11,7 @@ if [ ! -f "$ROOT/Config/ScadaInstanceConfig.xml" ]; then
 fi
 
 mkdir -p "$ROOT/logs"
+sed -i 's#<Directory>/opt/scada/</Directory>#<Directory>/data/rapid-scada/</Directory>#' "$ROOT/ScadaAgent/Config/ScadaAgentConfig.xml"
 
 if [ ! -f "$ROOT/Views/HelloWorld/T3000-Starter.mim" ]; then
   cp /usr/local/share/rapid-scada/starter-mimic.mim "$ROOT/Views/HelloWorld/T3000-Starter.mim"
