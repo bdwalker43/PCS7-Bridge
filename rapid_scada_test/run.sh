@@ -13,8 +13,15 @@ fi
 mkdir -p "$ROOT/logs"
 sed -i 's#<Directory>/opt/scada/</Directory>#<Directory>/data/rapid-scada/</Directory>#' "$ROOT/ScadaAgent/Config/ScadaAgentConfig.xml"
 
+# The editor resolves relative mimic paths from ScadaWeb, while the
+# runtime project stores views under $ROOT/Views. Keep the safe demo file
+# in both locations so it can be opened directly in the browser editor.
+mkdir -p "$ROOT/Views/HelloWorld" "$ROOT/ScadaWeb/HelloWorld"
 if [ ! -f "$ROOT/Views/HelloWorld/T3000-Starter.mim" ]; then
   cp /usr/local/share/rapid-scada/starter-mimic.mim "$ROOT/Views/HelloWorld/T3000-Starter.mim"
+fi
+if [ ! -f "$ROOT/ScadaWeb/HelloWorld/T3000-Starter.mim" ]; then
+  cp /usr/local/share/rapid-scada/starter-mimic.mim "$ROOT/ScadaWeb/HelloWorld/T3000-Starter.mim"
 fi
 
 shutdown() {
