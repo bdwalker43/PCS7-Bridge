@@ -4,8 +4,11 @@ RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://rapidscada.org/download/rapidscada_6.4.7_linux_en.zip -o /tmp/rapidscada.zip \
+    && curl -fsSL https://rapidscada.org/download/plg_mim_extra_comp/plg_mim_extra_comp_6.0.2.1_en.zip -o /tmp/mim-extra.zip \
     && unzip -q /tmp/rapidscada.zip 'scada/*' -d /opt \
-    && rm -f /tmp/rapidscada.zip \
+    && unzip -q /tmp/mim-extra.zip -d /tmp/mim-extra \
+    && cp -a /tmp/mim-extra/SCADA/. /opt/scada/ \
+    && rm -rf /tmp/rapidscada.zip /tmp/mim-extra.zip /tmp/mim-extra \
     && chmod +x /opt/scada/make_executable.sh \
     && /opt/scada/make_executable.sh \
     && mv /opt/scada /opt/rapidscada-seed
