@@ -13,9 +13,17 @@ fi
 mkdir -p "$ROOT/logs"
 sed -i 's#<Directory>/opt/scada/</Directory>#<Directory>/data/rapid-scada/</Directory>#' "$ROOT/ScadaAgent/Config/ScadaAgentConfig.xml"
 
-# The editor finds a project by walking upward from the mimic file until
-# it reaches an .rsproj file. Keep a minimal project marker beside the
-# safe demo mimic in both the runtime and web-editor paths.
+if [ ! -f "$ROOT/ScadaWeb/PlgMimExtraComp.dll" ]; then
+  cp -a /opt/rapidscada-seed/ScadaWeb/PlgMimExtraComp.dll "$ROOT/ScadaWeb/"
+  cp -a /opt/rapidscada-seed/ScadaWeb/lang/PlgMimExtraComp.en-GB.xml "$ROOT/ScadaWeb/lang/"
+  cp -a /opt/rapidscada-seed/ScadaWeb/lang/PlgMimExtraComp.ru-RU.xml "$ROOT/ScadaWeb/lang/"
+  mkdir -p "$ROOT/ScadaWeb/wwwroot/plugins"
+  cp -a /opt/rapidscada-seed/ScadaWeb/wwwroot/plugins/MimExtraComp "$ROOT/ScadaWeb/wwwroot/plugins/"
+fi
+if ! grep -q 'PlgMimExtraComp' "$ROOT/ScadaWeb/config/ScadaWebConfig.xml"; then
+  sed -i 's#</Plugins>#    <Plugin code="PlgMimExtraComp" />\n  </Plugins>#' "$ROOT/ScadaWeb/config/ScadaWebConfig.xml"
+fi
+
 mkdir -p "$ROOT/Views/HelloWorld" "$ROOT/ScadaWeb/HelloWorld"
 if [ ! -f "$ROOT/Views/HelloWorld/T3000-Starter.mim" ]; then
   cp /usr/local/share/rapid-scada/starter-mimic.mim "$ROOT/Views/HelloWorld/T3000-Starter.mim"
