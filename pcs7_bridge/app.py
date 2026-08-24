@@ -13,6 +13,7 @@ import os
 import re
 import struct
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+
+from command_runtime import Command, CommandEngine, Journal
 
 DATA = Path("/data")
 STATE_FILE = DATA / "pcs7-bridge.json"
@@ -36,8 +39,12 @@ DEFAULT_STATE = {
     "pending": [],
     "last_probe": None,
 }
-runtime: dict[str, Any] = {"running": False, "last_sync": None, "last_error": None}
+runtime: dict[str, Any] = {
+    "running": False, "last_sync": None, "last_error": None,
+    "last_command_poll": None, "last_command_error": None, "last_command_events": [],
+}
 plc_lock = asyncio.Lock()
+command_session: Any | None = None
 
 
 def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -49,8 +56,12 @@ def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
 
 
 def options() -> dict[str, Any]:
-    return read_json(OPTIONS_FILE, {"plc_host": "192.168.40.200", "rack": 0, "slot": 3,
-                                    "poll_interval_s": 5, "write_enabled": False})
+    defaults = {"plc_host": "192.168.40.200", "rack": 0, "slot": 3,
+                "poll_interval_s": 5, "write_enabled": False,
+                "commands_enabled": False, "command_poll_ms": 500,
+                "command_max_risk_tier": 1}
+    defaults.update(read_json(OPTIONS_FILE, {}))
+    return defaults
 
 
 def state() -> dict[str, Any]:
@@ -173,6 +184,78 @@ def write_points(points: list[dict[str, Any]], values: dict[str, str]) -> None:
             pass
 
 
+def execute_command(command: Command, value: object) -> None:
+    """Call only the fixed service family approved by a saved command mapping."""
+    domain = command.entity_id.split(".", 1)[0]
+    data: dict[str, object] = {"entity_id": command.entity_id}
+    if command.action == "power":
+        service = "turn_on" if value else "turn_off"
+    elif command.action == "set_temperature":
+        domain, service, data = "climate", "set_temperature", {**data, "temperature": value}
+    elif command.action == "set_value":
+        service, data = "set_value", {**data, "value": value}
+    elif command.action == "percentage":
+        domain, service, data = "fan", "set_percentage", {**data, "percentage": value}
+    elif command.action == "brightness_pct":
+        domain, service, data = "light", "turn_on", {**data, "brightness_pct": value}
+    elif command.action == "select_option":
+        service, data = "select_option", {**data, "option": value}
+    elif command.action == "set_hvac_mode":
+        domain, service, data = "climate", "set_hvac_mode", {**data, "hvac_mode": value}
+    elif command.action == "set_fan_mode":
+        domain, service, data = "climate", "set_fan_mode", {**data, "fan_mode": value}
+    elif command.action == "activate":
+        service = "press" if domain == "button" else "turn_on"
+    else:
+        raise ValueError(f"unsupported approved action {command.action!r}")
+    body = json.dumps(data).encode("utf-8")
+    request = urllib.request.Request(
+        f"{HA_API}/services/{domain}/{service}", data=body, method="POST",
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        if not 200 <= response.status < 300:
+            raise RuntimeError(f"Home Assistant returned HTTP {response.status}")
+
+
+class CommandSession:
+    """One persistent, serialized DB58 session.  Reconfiguration re-baselines."""
+    def __init__(self) -> None:
+        self.client = None
+        self.engine = None
+        self.signature = None
+
+    def close(self) -> None:
+        if self.client:
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+        self.client = self.engine = None
+        self.signature = None
+
+    def poll(self, commands: list[dict[str, Any]], config: dict[str, Any]) -> list[tuple[str, int]]:
+        """Poll only named, allow-listed commands; initial values are never dispatched."""
+        import snap7
+        signature = json.dumps({"commands": commands, "host": config["plc_host"],
+                                "rack": config["rack"], "slot": config["slot"],
+                                "tier": config["command_max_risk_tier"]}, sort_keys=True)
+        if signature != self.signature:
+            self.close()
+            self.client = snap7.client.Client()
+            self.client.connect(config["plc_host"], int(config["rack"]), int(config["slot"]))
+            if not self.client.get_connected():
+                self.close()
+                raise RuntimeError("S7 connection did not complete")
+            self.engine = CommandEngine(
+                commands, lambda db, start, size: bytes(self.client.db_read(db, start, size)),
+                lambda db, start, payload: self.client.db_write(db, start, payload), execute_command,
+                Journal(DATA / "command-journal.json"), max_risk_tier=int(config["command_max_risk_tier"]),
+            )
+            self.signature = signature
+        return self.engine.poll()
+
+
 async def sync_loop() -> None:
     """The operational data loop. It is inert until the add-on is armed."""
     runtime["running"] = True
@@ -194,6 +277,28 @@ async def sync_loop() -> None:
         await asyncio.sleep(max(1, int(options().get("poll_interval_s", 5))))
 
 
+async def command_loop() -> None:
+    """Separate fail-closed DB58 loop; it never runs unless explicitly armed."""
+    global command_session
+    command_session = CommandSession()
+    while True:
+        config = options()
+        commands = state().get("commands", [])
+        try:
+            if config.get("commands_enabled") and commands:
+                async with plc_lock:
+                    events = await asyncio.to_thread(command_session.poll, commands, config)
+                runtime["last_command_poll"] = int(time.time())
+                runtime["last_command_events"] = events[-12:]
+                runtime["last_command_error"] = None
+            else:
+                command_session.close()
+        except Exception as exc:
+            runtime["last_command_error"] = f"{type(exc).__name__}: {exc}"
+            command_session.close()
+        await asyncio.sleep(max(0.1, int(config.get("command_poll_ms", 500)) / 1000))
+
+
 app = FastAPI(title="PCS 7 Bridge")
 
 
@@ -202,7 +307,7 @@ def status() -> dict[str, Any]:
     current = state()
     active_points = [point for point in current["points"] if not point.get("removed")]
     return {
-        "plc": {key: options()[key] for key in ("plc_host", "rack", "slot", "write_enabled")},
+        "plc": {key: options()[key] for key in ("plc_host", "rack", "slot", "write_enabled", "commands_enabled")},
         "points": len(active_points),
         "removed": len(current["points"]) - len(active_points),
         "pending": len(current["pending"]),
@@ -225,6 +330,12 @@ async def get_states() -> list[dict[str, str]]:
 @app.get("/api/points")
 def get_points() -> list[dict[str, Any]]:
     return state()["points"]
+
+
+@app.get("/api/commands")
+def get_commands() -> list[dict[str, Any]]:
+    """The current reviewed command allow-list; empty means no command path exists."""
+    return state().get("commands", [])
 
 
 @app.post("/api/points/preview")
@@ -329,4 +440,5 @@ if __name__ == "__main__":
     @app.on_event("startup")
     async def start_sync_loop() -> None:
         asyncio.create_task(sync_loop())
+        asyncio.create_task(command_loop())
     uvicorn.run(app, host="0.0.0.0", port=8099)
