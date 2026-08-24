@@ -1,0 +1,332 @@
+"""PCS 7 Bridge Home Assistant app.
+
+The app owns the approved mapping database in /data.  It is intentionally
+fail-closed: S7 writes and PLC-to-HA commands are disabled unless separately
+armed in the add-on settings.  This first release supplies the HA-native UI,
+state discovery, mapping validation, and a read-only S7 connectivity probe.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import struct
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+DATA = Path("/data")
+STATE_FILE = DATA / "pcs7-bridge.json"
+OPTIONS_FILE = DATA / "options.json"
+SEED_FILE = Path("/app/seed.json")
+HA_API = "http://supervisor/core/api"
+TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,38}$")
+
+DEFAULT_STATE = {
+    "version": 1,
+    "points": [],
+    "commands": [],
+    "pending": [],
+    "last_probe": None,
+}
+runtime: dict[str, Any] = {"running": False, "last_sync": None, "last_error": None}
+plc_lock = asyncio.Lock()
+
+
+def read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else fallback.copy()
+    except (OSError, json.JSONDecodeError):
+        return fallback.copy()
+
+
+def options() -> dict[str, Any]:
+    return read_json(OPTIONS_FILE, {"plc_host": "192.168.40.200", "rack": 0, "slot": 3,
+                                    "poll_interval_s": 5, "write_enabled": False})
+
+
+def state() -> dict[str, Any]:
+    if STATE_FILE.exists():
+        saved = read_json(STATE_FILE, DEFAULT_STATE)
+        seed = read_json(SEED_FILE, DEFAULT_STATE)
+        if seed.get("points"):
+            # A previous preview/probe can create a small state file before
+            # this release's reserved engineering map is available. Merge it
+            # rather than losing its audit data, while retaining any future
+            # user-added points as overrides/new rows.
+            by_id = {point["point_id"]: point for point in seed["points"]}
+            for point in saved.get("points", []):
+                by_id[point["point_id"]] = point
+            saved["points"] = list(by_id.values())
+        return saved
+    # The seeded engineering map is read-only until the first local change.
+    # It reserves all generated DB59/DB60 addresses so a new point cannot be
+    # allocated into an established interface range.
+    return read_json(SEED_FILE, DEFAULT_STATE)
+
+
+def save(value: dict[str, Any]) -> None:
+    DATA.mkdir(parents=True, exist_ok=True)
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(STATE_FILE)
+
+
+class PointRequest(BaseModel):
+    entity_id: str = Field(pattern=r"^[a-z_]+\.[a-z0-9_]+$")
+    name: str = Field(min_length=3, max_length=80)
+    member_name: str = Field(pattern=r"^[A-Z][A-Z0-9_]{2,23}$")
+    kind: str = Field(pattern=r"^(real|bool)$")
+    stale_after_s: int = Field(ge=60, le=2_592_000)
+    unit: str = Field(default="", max_length=20)
+
+
+def next_address(current: list[dict[str, Any]], kind: str) -> tuple[int, int]:
+    db = 60 if kind == "real" else 59
+    members = [p for p in current if p.get("db_number") == db]
+    if not members:
+        return (4 if kind == "real" else 0), (8 if kind == "real" else 1)
+    last = max(members, key=lambda p: int(p["byte_offset"]))
+    start = int(last["byte_offset"]) + (6 if kind == "real" else 2)
+    return start, start + (4 if kind == "real" else 1)
+
+
+def proposed_point(request: PointRequest, current: list[dict[str, Any]]) -> dict[str, Any]:
+    if any(p["entity_id"] == request.entity_id and not p.get("removed") for p in current):
+        raise HTTPException(409, "This Home Assistant entity is already mapped.")
+    if any(p["member_name"] == request.member_name for p in current):
+        raise HTTPException(409, "This PCS 7 member name is already mapped.")
+    offset, quality = next_address(current, request.kind)
+    return {
+        "point_id": f"HA_{len(current) + 1:03d}",
+        "entity_id": request.entity_id,
+        "name": request.name.strip(),
+        "member_name": request.member_name,
+        "kind": request.kind,
+        "unit": request.unit.strip(),
+        "db_number": 60 if request.kind == "real" else 59,
+        "byte_offset": offset,
+        "quality_byte_offset": quality,
+        "stale_after_s": request.stale_after_s,
+        "enabled": False,
+        "created_at": int(time.time()),
+    }
+
+
+async def ha_states() -> list[dict[str, Any]]:
+    if not TOKEN:
+        return []
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    async with httpx.AsyncClient(timeout=8) as client:
+        response = await client.get(f"{HA_API}/states", headers=headers)
+        response.raise_for_status()
+        result = response.json()
+    return result if isinstance(result, list) else []
+
+
+def decode_state(point: dict[str, Any], raw: str) -> tuple[object, int]:
+    """Convert HA state to an approved typed value and PCS 7 quality byte."""
+    if raw.strip().lower() in {"", "unknown", "unavailable", "none"}:
+        return (0.0 if point["kind"] == "real" else False), 0x00
+    if point["kind"] == "real":
+        try:
+            number = float(raw)
+        except ValueError:
+            return 0.0, 0x00
+        return (number, 0x80) if number == number and abs(number) != float("inf") else (0.0, 0x00)
+    normalized = raw.strip().lower()
+    if normalized in {"on", "true", "1", "open", "home"}:
+        return True, 0x80
+    if normalized in {"off", "false", "0", "closed", "not_home"}:
+        return False, 0x80
+    return False, 0x00
+
+
+def write_points(points: list[dict[str, Any]], values: dict[str, str]) -> None:
+    """Write only explicitly activated and typed mappings. Runs in a worker thread."""
+    import snap7
+    config = options()
+    client = snap7.client.Client()
+    try:
+        client.connect(config["plc_host"], int(config["rack"]), int(config["slot"]))
+        if not client.get_connected():
+            raise RuntimeError("S7 connection did not complete")
+        for point in points:
+            value, quality = decode_state(point, values.get(point["entity_id"], "unavailable"))
+            if point["kind"] == "real":
+                payload = struct.pack(">fBB", float(value), quality, 0)
+            else:
+                payload = bytes((1 if value else 0, quality))
+            client.db_write(int(point["db_number"]), int(point["byte_offset"]), payload)
+    finally:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+
+async def sync_loop() -> None:
+    """The operational data loop. It is inert until the add-on is armed."""
+    runtime["running"] = True
+    while True:
+        try:
+            config = options()
+            current = state()
+            active = [p for p in current["points"] if p.get("enabled")]
+            if config.get("write_enabled") and active:
+                raw = await ha_states()
+                values = {item["entity_id"]: str(item.get("state", "")) for item in raw
+                          if isinstance(item, dict) and isinstance(item.get("entity_id"), str)}
+                async with plc_lock:
+                    await asyncio.to_thread(write_points, active, values)
+                runtime["last_sync"] = int(time.time())
+                runtime["last_error"] = None
+        except Exception as exc:
+            runtime["last_error"] = f"{type(exc).__name__}: {exc}"
+        await asyncio.sleep(max(1, int(options().get("poll_interval_s", 5))))
+
+
+app = FastAPI(title="PCS 7 Bridge")
+
+
+@app.get("/api/status")
+def status() -> dict[str, Any]:
+    current = state()
+    active_points = [point for point in current["points"] if not point.get("removed")]
+    return {
+        "plc": {key: options()[key] for key in ("plc_host", "rack", "slot", "write_enabled")},
+        "points": len(active_points),
+        "removed": len(current["points"]) - len(active_points),
+        "pending": len(current["pending"]),
+        "last_probe": current.get("last_probe"),
+        "runtime": runtime.copy(),
+    }
+
+
+@app.get("/api/states")
+async def get_states() -> list[dict[str, str]]:
+    try:
+        raw = await ha_states()
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, f"Home Assistant API unavailable: {exc}") from exc
+    return [{"entity_id": item["entity_id"], "state": str(item.get("state", "")),
+             "name": str(item.get("attributes", {}).get("friendly_name", item["entity_id"]))}
+            for item in raw if isinstance(item, dict) and "entity_id" in item]
+
+
+@app.get("/api/points")
+def get_points() -> list[dict[str, Any]]:
+    return state()["points"]
+
+
+@app.post("/api/points/preview")
+def preview_point(request: PointRequest) -> dict[str, Any]:
+    return proposed_point(request, state()["points"])
+
+
+@app.post("/api/points")
+def add_point(request: PointRequest) -> dict[str, Any]:
+    current = state()
+    point = proposed_point(request, current["points"])
+    current["points"].append(point)
+    current["pending"].append({
+        "type": "new_input", "point_id": point["point_id"], "created_at": point["created_at"],
+        "status": "needs_pcs7_engineering",
+        "steps": [
+            f"Append {point['member_name']} to existing DB{point['db_number']} (never recreate the DB).",
+            "Compile/download the updated PCS 7 DB.",
+            "Connect the approved structured value and status in CFC.",
+            "Return here and explicitly enable the point after live verification.",
+        ],
+    })
+    save(current)
+    return point
+
+
+@app.post("/api/points/{point_id}/activate")
+def activate_point(point_id: str) -> dict[str, Any]:
+    """Require both an HA option arm and an explicit per-point activation."""
+    if not options().get("write_enabled"):
+        raise HTTPException(409, "PLC writes are disabled in add-on settings.")
+    current = state()
+    for point in current["points"]:
+        if point["point_id"] == point_id:
+            point["enabled"] = True
+            save(current)
+            return point
+    raise HTTPException(404, "Point not found.")
+
+
+@app.delete("/api/points/{point_id}")
+def remove_point(point_id: str) -> dict[str, Any]:
+    """Remove a mapping from the bridge without reusing its PCS 7 address."""
+    current = state()
+    for point in current["points"]:
+        if point["point_id"] == point_id:
+            point["removed"] = True
+            point["enabled"] = False
+            current["pending"] = [item for item in current["pending"]
+                                  if item.get("point_id") != point_id]
+            save(current)
+            return {"point_id": point_id, "removed": True,
+                    "detail": "Removed from the bridge map; its DB address remains reserved until PCS 7 is separately cleaned up."}
+    raise HTTPException(404, "Point not found.")
+
+
+@app.post("/api/probe")
+def probe() -> dict[str, Any]:
+    """One read-only S7 probe. Never writes, and never runs automatically."""
+    config = options()
+    result: dict[str, Any] = {"at": int(time.time()), "ok": False, "detail": ""}
+    try:
+        import snap7
+        client = snap7.client.Client()
+        client.connect(config["plc_host"], int(config["rack"]), int(config["slot"]))
+        result["ok"] = bool(client.get_connected())
+        result["detail"] = "S7 session established (read-only probe); no DB read or write was performed."
+        client.disconnect()
+    except Exception as exc:  # surfaced in UI without a traceback
+        result["detail"] = f"S7 probe failed: {type(exc).__name__}: {exc}"
+    current = state()
+    current["last_probe"] = result
+    save(current)
+    return result
+
+
+UI = r'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PCS 7 Bridge</title><style>:root{color-scheme:dark}*{min-width:0}html,body{max-width:100%;overflow-x:hidden}body{font:15px system-ui;margin:0;background:#101827;color:#e5e7eb}main{box-sizing:border-box;width:100%;max-width:1180px;margin:auto;padding:24px}h1,h2{margin:0 0 8px;overflow-wrap:anywhere}h2{font-size:1.25rem}.sub,.muted{color:#9ca3af;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(185px,100%),1fr));gap:12px;margin:18px 0}.card,form,.table-wrap{box-sizing:border-box;max-width:100%;background:#182234;border:1px solid #304056;border-radius:12px;padding:16px}.label{color:#94a3b8;font-size:.75rem;letter-spacing:.06em;text-transform:uppercase}strong{font-size:1.1rem;overflow-wrap:anywhere}.nav{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0}.nav button{width:auto;max-width:100%;margin:0;background:#243247}.nav button.active{background:#2563eb}.section{display:none}.section.active{display:block}input,select,button{box-sizing:border-box;max-width:100%;width:100%;padding:10px;margin:5px 0 12px;border-radius:7px;border:1px solid #40516a;background:#0f172a;color:white}button{background:#2563eb;border:0;font-weight:700;cursor:pointer}button.danger{background:#991b1b;width:auto;margin:0;padding:7px 10px}button.warn{background:#92400e}select{white-space:normal}table{width:100%;max-width:100%;border-collapse:collapse;table-layout:fixed}td,th{padding:10px;text-align:left;border-bottom:1px solid #304056;vertical-align:top;overflow-wrap:anywhere;word-break:break-word}th button{background:transparent;color:#cbd5e1;padding:0;margin:0;text-align:left;font-size:inherit}th button:hover{color:#fff}.notice{box-sizing:border-box;max-width:100%;overflow-wrap:anywhere;white-space:pre-wrap;padding:12px;border-radius:8px;background:#172554;display:none}.pill{display:inline-block;max-width:100%;overflow-wrap:anywhere;padding:3px 7px;border-radius:20px;background:#26364c;color:#cbd5e1;font-size:.78rem}.table-wrap{overflow-x:auto}.empty{padding:18px;color:#94a3b8;text-align:center}@media(max-width:720px){main{padding:12px}.card,form,.table-wrap{padding:12px}.nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.nav button{width:100%;font-size:.88rem}.table-wrap{overflow:hidden;padding:8px}table,tbody,tr,td{display:block;width:100%;box-sizing:border-box}thead{display:none}tr{padding:8px 0;border-bottom:1px solid #304056}td{border:0;padding:5px 8px}td::before{content:attr(data-label);display:block;color:#94a3b8;font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;margin-bottom:2px}td:last-child{padding-top:8px}td:last-child::before{display:none}.empty{display:table-cell}.empty::before{display:none}}</style></head><body><main>
+<h1>PCS 7 Bridge</h1><p class="sub">One controlled map between Home Assistant and PCS 7. PLC writes remain disabled until a reviewed cutover.</p>
+<div class="grid" id="status"></div><p id="notice" class="notice"></p>
+<nav class="nav"><button class="active" data-tab="add">Add input</button><button data-tab="map">Point map</button><button data-tab="commands">Commands</button><button data-tab="connection">Connection</button></nav>
+<section class="section active" id="add"><h2>Add Home Assistant input</h2><form id="addForm"><label>Find an unmapped Home Assistant entity</label><input id="entitySearch" autocomplete="off" placeholder="Search by name or entity ID"><label>Available entities</label><select id="entity" size="9" required><option value="">Loading Home Assistant entities…</option></select><p class="muted" id="entityCount"></p><label>Display name</label><input id="name" required><label>PCS 7 member name</label><input id="member" required maxlength="24" placeholder="HA_GARAGE_TEMP"><label>Type</label><select id="kind"><option value="real">REAL · DB60</option><option value="bool">BOOL · DB59</option></select><label>Unit (optional)</label><input id="unit" placeholder="°F"><label>Stale after seconds</label><input id="stale" type="number" min="60" value="900"><button type="button" id="preview">Preview mapping</button><button type="submit">Add as pending deployment</button></form></section>
+<section class="section" id="map"><h2>Point map cleanup</h2><p class="muted">Tap a column heading to sort. On narrow screens, each mapping becomes a full-width card so no fields or actions are cut off. Removing a point stops it being part of this bridge and returns its HA entity to the Add list. Its PCS 7 address stays reserved until you separately clean up the DB/CFC project.</p><input id="mapSearch" placeholder="Search mapped points"><div class="table-wrap"><table><thead><tr><th><button data-sort="name">Name ↕</button></th><th><button data-sort="entity_id">Home Assistant ↕</button></th><th><button data-sort="pcs7">PCS 7 ↕</button></th><th><button data-sort="status">Status ↕</button></th><th>Action</th></tr></thead><tbody id="points"></tbody></table></div></section>
+<section class="section" id="commands"><h2>PCS 7 → Home Assistant commands</h2><div class="card"><strong>Coming in the cutover build</strong><p class="muted">This will map named DB58 command points to explicit, typed Home Assistant services with value limits, feedback, and history. Commands remain disabled until the old bridge is replaced.</p></div></section>
+<section class="section" id="connection"><h2>Connection test</h2><div class="card"><button class="warn" id="probe">Run one read-only Snap7 connection probe</button><p class="muted">This opens then closes one S7 session. It does not read or write a PLC DB.</p></div></section>
+</main><script>
+const j=(u,o={})=>fetch(u,o).then(async r=>{let x=await r.json();if(!r.ok)throw Error(x.detail||r.statusText);return x});const n=document.querySelector('#notice');let allEntities=[],points=[],sortKey='name',sortDirection=1;const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function say(x){n.textContent=x;n.style.display='block'}
+function memberFor(text){return ('HA_'+text.toUpperCase().replace(/[^A-Z0-9]+/g,'_').replace(/^_+|_+$/g,'')).slice(0,24).replace(/_+$/,'')}
+function renderEntities(){let q=entitySearch.value.trim().toLowerCase(),mapped=new Set(points.filter(x=>!x.removed).map(x=>x.entity_id)),shown=allEntities.filter(x=>!mapped.has(x.entity_id)&&(!q||x.entity_id.toLowerCase().includes(q)||x.name.toLowerCase().includes(q)));entity.innerHTML=shown.map(x=>`<option value="${esc(x.entity_id)}">${esc(x.name)} — ${esc(x.entity_id)} (${esc(x.state)})</option>`).join('')||'<option value="">No unmapped entities match</option>';entityCount.textContent=`${shown.length} available · ${mapped.size} already mapped`}
+function pointSortValue(x){if(sortKey==='pcs7')return `${String(x.db_number).padStart(4,'0')}:${String(x.byte_offset).padStart(6,'0')}`;if(sortKey==='status')return x.enabled?'active':x.existing?'existing map':'pending';return String(x[sortKey]||'').toLowerCase()}function renderPoints(){let q=mapSearch.value.trim().toLowerCase(),shown=points.filter(x=>!x.removed&&(!q||[x.name,x.entity_id,x.member_name,x.point_id].join(' ').toLowerCase().includes(q))).sort((a,b)=>pointSortValue(a).localeCompare(pointSortValue(b),undefined,{numeric:true})*sortDirection);document.querySelector('#points').innerHTML=shown.map(x=>`<tr><td data-label="Name">${esc(x.name)}<br><span class=pill>${esc(x.point_id)}</span></td><td data-label="Home Assistant">${esc(x.entity_id)}</td><td data-label="PCS 7">DB${x.db_number} · ${esc(x.member_name)}<br><span class=muted>byte ${x.byte_offset}</span></td><td data-label="Status">${x.enabled?'Active':x.existing?'Existing map':'Pending'}</td><td data-label="Action"><button class=danger data-remove="${esc(x.point_id)}">Remove</button></td></tr>`).join('')||'<tr><td colspan=5 class=empty>No mapped points match.</td></tr>';document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>removePoint(b.dataset.remove));document.querySelectorAll('[data-sort]').forEach(b=>b.textContent=b.dataset.sort==='pcs7'?`PCS 7 ${sortKey==='pcs7'?(sortDirection===1?'↑':'↓'):'↕'}`:`${b.dataset.sort==='entity_id'?'Home Assistant':b.dataset.sort[0].toUpperCase()+b.dataset.sort.slice(1)} ${sortKey===b.dataset.sort?(sortDirection===1?'↑':'↓'):'↕'}`)}
+async function load(){let[s,p,e]=await Promise.all([j('api/status'),j('api/points'),j('api/states').catch(()=>[])]);points=p;allEntities=e;document.querySelector('#status').innerHTML=`<div class=card><div class=label>PLC endpoint</div><strong>${s.plc.plc_host} · R${s.plc.rack}/S${s.plc.slot}</strong></div><div class=card><div class=label>Mapped points</div><strong>${s.points}</strong></div><div class=card><div class=label>Pending engineering</div><strong>${s.pending}</strong></div><div class=card><div class=label>PLC writes</div><strong>${s.plc.write_enabled?'ARMED':'DISABLED'}</strong></div>`;renderEntities();renderPoints()}
+function payload(){return {entity_id:entity.value,name:name.value,member_name:member.value,kind:kind.value,unit:unit.value,stale_after_s:Number(stale.value)}};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});document.querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>{if(sortKey===b.dataset.sort)sortDirection*=-1;else{sortKey=b.dataset.sort;sortDirection=1}renderPoints()});entitySearch.oninput=renderEntities;mapSearch.oninput=renderPoints;entity.onchange=()=>{let x=allEntities.find(x=>x.entity_id===entity.value);if(x){if(!name.value)name.value=x.name;if(!member.value)member.value=memberFor(x.name)}};async function removePoint(id){if(!confirm(`Remove ${id} from this bridge map? Its PCS 7 address remains reserved.`))return;try{let x=await j(`api/points/${id}`,{method:'DELETE'});say(x.detail);load()}catch(e){say(e.message)}}preview.onclick=async()=>{try{let x=await j('api/points/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Preview\n${x.point_id}: ${x.entity_id}\nDB${x.db_number}.${x.member_name} at byte ${x.byte_offset}; quality byte ${x.quality_byte_offset}\nNo change has been saved.`)}catch(e){say(e.message)}};addForm.onsubmit=async e=>{e.preventDefault();try{let x=await j('api/points',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Added ${x.point_id} as a pending deployment. It is not enabled and cannot write to the PLC.`);load()}catch(e){say(e.message)}};probe.onclick=async()=>{try{let x=await j('api/probe',{method:'POST'});say(x.detail);load()}catch(e){say(e.message)}};load();</script></body></html>'''
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    return UI
+
+
+if __name__ == "__main__":
+    import uvicorn
+    @app.on_event("startup")
+    async def start_sync_loop() -> None:
+        asyncio.create_task(sync_loop())
+    uvicorn.run(app, host="0.0.0.0", port=8099)
