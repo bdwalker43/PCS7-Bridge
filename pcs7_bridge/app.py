@@ -381,6 +381,36 @@ def arm_commands(request: dict[str, Any]) -> dict[str, Any]:
     return {"commands_enabled": enabled}
 
 
+@app.post("/api/telemetry/arm")
+def arm_telemetry(request: dict[str, Any]) -> dict[str, Any]:
+    """Persist the explicit HA-to-PLC telemetry writer arm."""
+    enabled = request.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(422, "enabled must be a boolean.")
+    override = read_json(RUNTIME_OPTIONS_FILE, {})
+    override["write_enabled"] = enabled
+    DATA.mkdir(parents=True, exist_ok=True)
+    temporary = RUNTIME_OPTIONS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(override, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(RUNTIME_OPTIONS_FILE)
+    return {"write_enabled": enabled}
+
+
+@app.post("/api/points/activate-existing")
+def activate_existing_points() -> dict[str, int]:
+    """Activate only the reviewed imported map; user-created pending points stay off."""
+    if not options().get("write_enabled"):
+        raise HTTPException(409, "PLC writes are disabled in add-on settings.")
+    current = state()
+    count = 0
+    for point in current["points"]:
+        if point.get("existing") and not point.get("removed"):
+            point["enabled"] = True
+            count += 1
+    save(current)
+    return {"activated": count}
+
+
 @app.post("/api/points/preview")
 def preview_point(request: PointRequest) -> dict[str, Any]:
     return proposed_point(request, state()["points"])
