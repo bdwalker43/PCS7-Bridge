@@ -28,6 +28,7 @@ DATA = Path("/data")
 STATE_FILE = DATA / "pcs7-bridge.json"
 COMMAND_MAP_FILE = DATA / "command-map.json"
 OPTIONS_FILE = DATA / "options.json"
+RUNTIME_OPTIONS_FILE = DATA / "bridge-runtime.json"
 SEED_FILE = Path("/app/seed.json")
 HA_API = "http://supervisor/core/api"
 TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -62,6 +63,7 @@ def options() -> dict[str, Any]:
                 "commands_enabled": False, "command_poll_ms": 500,
                 "command_max_risk_tier": 1}
     defaults.update(read_json(OPTIONS_FILE, {}))
+    defaults.update(read_json(RUNTIME_OPTIONS_FILE, {}))
     return defaults
 
 
@@ -362,6 +364,21 @@ def import_commands(command_map: dict[str, Any]) -> dict[str, int]:
     temporary.write_text(json.dumps({"commands": commands}, indent=2) + "\n", encoding="utf-8")
     temporary.replace(COMMAND_MAP_FILE)
     return {"commands": len(parsed)}
+
+
+@app.post("/api/commands/arm")
+def arm_commands(request: dict[str, Any]) -> dict[str, Any]:
+    """Persist the explicit global command arm independently of HA app options."""
+    enabled = request.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(422, "enabled must be a boolean.")
+    override = read_json(RUNTIME_OPTIONS_FILE, {})
+    override["commands_enabled"] = enabled
+    temporary = RUNTIME_OPTIONS_FILE.with_suffix(".tmp")
+    DATA.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(json.dumps(override, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(RUNTIME_OPTIONS_FILE)
+    return {"commands_enabled": enabled}
 
 
 @app.post("/api/points/preview")
