@@ -36,12 +36,22 @@ class Command:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Command":
+        enabled = raw.get("enabled", False)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() == "true"
+        fixed_value = raw.get("fixed_value")
+        if fixed_value == "":
+            fixed_value = None
+        minimum = raw.get("min_value")
+        maximum = raw.get("max_value")
+        minimum = None if minimum in (None, "") else float(minimum)
+        maximum = None if maximum in (None, "") else float(maximum)
         command = cls(
             command_id=str(raw["command_id"]), byte_offset=int(raw["byte_offset"]),
-            entity_id=str(raw["entity_id"]), action=str(raw["action"]),
-            kind=str(raw["kind"]), min_value=raw.get("min_value"),
-            max_value=raw.get("max_value"), fixed_value=raw.get("fixed_value"),
-            enabled=bool(raw.get("enabled", False)), risk_tier=int(raw.get("risk_tier", 1)),
+            entity_id=str(raw.get("entity_id", raw.get("ha_entity"))), action=str(raw["action"]),
+            kind=str(raw.get("kind", raw.get("value_kind"))), min_value=minimum,
+            max_value=maximum, fixed_value=fixed_value,
+            enabled=bool(enabled), risk_tier=int(raw.get("risk_tier", 1)),
         )
         if command.kind not in {"bool", "real", "pulse"}:
             raise ValueError("unsupported command kind")

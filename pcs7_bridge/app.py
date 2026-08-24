@@ -26,6 +26,7 @@ from command_runtime import Command, CommandEngine, Journal
 
 DATA = Path("/data")
 STATE_FILE = DATA / "pcs7-bridge.json"
+COMMAND_MAP_FILE = DATA / "command-map.json"
 OPTIONS_FILE = DATA / "options.json"
 SEED_FILE = Path("/app/seed.json")
 HA_API = "http://supervisor/core/api"
@@ -77,11 +78,17 @@ def state() -> dict[str, Any]:
             for point in saved.get("points", []):
                 by_id[point["point_id"]] = point
             saved["points"] = list(by_id.values())
+        if not saved.get("commands") and COMMAND_MAP_FILE.exists():
+            command_map = read_json(COMMAND_MAP_FILE, {})
+            saved["commands"] = command_map.get("commands", [])
         return saved
     # The seeded engineering map is read-only until the first local change.
     # It reserves all generated DB59/DB60 addresses so a new point cannot be
     # allocated into an established interface range.
-    return read_json(SEED_FILE, DEFAULT_STATE)
+    seeded = read_json(SEED_FILE, DEFAULT_STATE)
+    if not seeded.get("commands") and COMMAND_MAP_FILE.exists():
+        seeded["commands"] = read_json(COMMAND_MAP_FILE, {}).get("commands", [])
+    return seeded
 
 
 def save(value: dict[str, Any]) -> None:
@@ -336,6 +343,25 @@ def get_points() -> list[dict[str, Any]]:
 def get_commands() -> list[dict[str, Any]]:
     """The current reviewed command allow-list; empty means no command path exists."""
     return state().get("commands", [])
+
+
+@app.post("/api/commands/import")
+def import_commands(command_map: dict[str, Any]) -> dict[str, int]:
+    """Persist a reviewed DB58 map after validating every typed slot."""
+    commands = command_map.get("commands")
+    if not isinstance(commands, list) or not commands:
+        raise HTTPException(422, "Expected a non-empty reviewed command map.")
+    try:
+        parsed = [Command.from_dict(item) for item in commands]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(422, f"Invalid command map: {exc}") from exc
+    if len({item.command_id for item in parsed}) != len(parsed):
+        raise HTTPException(422, "Command IDs must be unique.")
+    DATA.mkdir(parents=True, exist_ok=True)
+    temporary = COMMAND_MAP_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"commands": commands}, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(COMMAND_MAP_FILE)
+    return {"commands": len(parsed)}
 
 
 @app.post("/api/points/preview")
