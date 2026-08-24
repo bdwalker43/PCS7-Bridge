@@ -1,7 +1,7 @@
 name: PCS 7 Bridge
 slug: pcs7_bridge
 description: Manage approved Home Assistant to PCS 7 telemetry mappings from Home Assistant.
-version: 0.2.0
+version: 0.2.1
 url: https://github.com/bdwalker43/PCS7-Bridge
 arch:
   - amd64
