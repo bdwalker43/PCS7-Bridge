@@ -71,7 +71,7 @@ def state() -> dict[str, Any]:
     if STATE_FILE.exists():
         saved = read_json(STATE_FILE, DEFAULT_STATE)
         seed = read_json(SEED_FILE, DEFAULT_STATE)
-        if seed.get("points"):
+        if seed.get("points") and not saved.get("fresh_start"):
             # A previous preview/probe can create a small state file before
             # this release's reserved engineering map is available. Merge it
             # rather than losing its audit data, while retaining any future
@@ -409,6 +409,20 @@ def activate_existing_points() -> dict[str, int]:
             count += 1
     save(current)
     return {"activated": count}
+
+
+@app.post("/api/fresh-start")
+def fresh_start() -> dict[str, Any]:
+    """Clear imported maps while retaining the app, its connection settings, and audit probe."""
+    current = state()
+    fresh = {"version": 1, "points": [], "commands": [], "pending": [],
+             "last_probe": current.get("last_probe"), "fresh_start": True}
+    save(fresh)
+    DATA.mkdir(parents=True, exist_ok=True)
+    temporary = COMMAND_MAP_FILE.with_suffix(".tmp")
+    temporary.write_text('{"commands": []}\n', encoding="utf-8")
+    temporary.replace(COMMAND_MAP_FILE)
+    return {"points": 0, "commands": 0, "detail": "Fresh bridge map ready."}
 
 
 @app.post("/api/points/preview")
