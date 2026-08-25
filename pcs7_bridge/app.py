@@ -121,7 +121,7 @@ class CommandRequest(BaseModel):
     name: str = Field(min_length=3, max_length=80)
     member_name: str = Field(pattern=r"^[A-Z][A-Z0-9_]{2,38}$")
     kind: str = Field(pattern=r"^(bool|pulse|real)$")
-    action: str = Field(pattern=r"^(power|activate|set_value|set_temperature|percentage|brightness_pct)$")
+    action: str = Field(pattern=r"^(power|activate|set_value|set_temperature|percentage|brightness_pct|set_hvac_mode|set_fan_mode)$")
     byte_offset: int | None = Field(default=None, ge=16, le=65530)
     min_value: float | None = None
     max_value: float | None = None
@@ -353,7 +353,9 @@ async def get_states() -> list[dict[str, str]]:
     except httpx.HTTPError as exc:
         raise HTTPException(503, f"Home Assistant API unavailable: {exc}") from exc
     return [{"entity_id": item["entity_id"], "state": str(item.get("state", "")),
-             "name": str(item.get("attributes", {}).get("friendly_name", item["entity_id"]))}
+             "name": str(item.get("attributes", {}).get("friendly_name", item["entity_id"])),
+             "command_options": {key: item.get("attributes", {}).get(key, [])
+                                 for key in ("hvac_modes", "fan_modes")}}
             for item in raw if isinstance(item, dict) and "entity_id" in item]
 
 
@@ -381,8 +383,8 @@ def proposed_command(request: CommandRequest, commands: list[dict[str, Any]]) ->
     byte_offset = next_command_offset(commands, request.kind)
     if request.byte_offset is not None and request.byte_offset != byte_offset:
         raise HTTPException(409, f"DB58 byte {request.byte_offset} is not the next reserved slot; use byte {byte_offset}.")
-    if request.kind in {"bool", "pulse"} and request.action not in {"power", "activate"}:
-        raise HTTPException(422, "BOOL/pulse commands require power or activate.")
+    if request.kind in {"bool", "pulse"} and request.action not in {"power", "activate", "set_hvac_mode", "set_fan_mode"}:
+        raise HTTPException(422, "BOOL/pulse commands require a supported switching action.")
     if request.kind == "real" and request.action not in {"set_value", "set_temperature", "percentage", "brightness_pct"}:
         raise HTTPException(422, "REAL commands require a numeric set action.")
     if request.min_value is not None and request.max_value is not None and request.min_value > request.max_value:
@@ -650,7 +652,8 @@ UI = UI.replace('<p class="muted">The global arm and the individual command acti
 UI = UI.replace('<p class="muted">This is allocated automatically. Add the member to DB58 at this address; do not reuse or edit it.</p>', '')
 UI = UI.replace('<p class="muted">This opens then closes one S7 session. It does not read or write a PLC DB.</p>', '')
 UI = UI.replace("</body>", r'''<script>
-function commandPayload(){let n=x=>x.value===''?null:Number(x.value),choice=cmdAction.selectedOptions[0];return {entity_id:cmdEntity.value,name:cmdName.value,member_name:cmdMember.value,kind:choice?.dataset.kind,action:cmdAction.value,byte_offset:Number(cmdByte.value),min_value:n(cmdMin),max_value:n(cmdMax),risk_tier:Number(cmdTier.value)}}
+function commandChoices(entityId){let e=allEntities.find(x=>x.entity_id===entityId),d=(entityId||'').split('.',1)[0],a=e?.command_options||{},choice=[];if(['button','input_button'].includes(d))choice.push({kind:'pulse',action:'activate',label:'Pulse · activate / press'});else if(['input_boolean','switch'].includes(d))choice.push({kind:'bool',action:'power',label:'BOOL · power on/off'});else if(d==='number'||d==='input_number')choice.push({kind:'real',action:'set_value',label:'REAL · set numeric value'});else if(d==='climate'){choice.push({kind:'real',action:'set_temperature',label:'REAL · set temperature'});(Array.isArray(a.hvac_modes)?a.hvac_modes:[]).forEach(v=>choice.push({kind:'pulse',action:'set_hvac_mode',fixed_value:v,label:`Pulse · HVAC mode: ${v}`}));(Array.isArray(a.fan_modes)?a.fan_modes:[]).forEach(v=>choice.push({kind:'pulse',action:'set_fan_mode',fixed_value:v,label:`Pulse · fan mode: ${v}`}))}else if(d==='fan')choice.push({kind:'bool',action:'power',label:'BOOL · power on/off'},{kind:'real',action:'percentage',label:'REAL · set percentage'});else if(d==='light')choice.push({kind:'bool',action:'power',label:'BOOL · power on/off'},{kind:'real',action:'brightness_pct',label:'REAL · set brightness %'});return choice};function chooseCommandEntity(){let x=allEntities.find(x=>x.entity_id===cmdEntity.value),choices=commandChoices(cmdEntity.value);cmdAction.innerHTML=choices.map(x=>`<option value="${x.action}" data-kind="${x.kind}" data-fixed="${esc(x.fixed_value||'')}">${esc(x.label)}</option>`).join('')||'<option value="">No supported command action</option>';if(x){if(!cmdName.value)cmdName.value=x.name;if(!cmdMember.value)cmdMember.value=cmdMemberFor(x.name)}cmdByte.value=nextCommandByte(cmdAction.selectedOptions[0]?.dataset.kind||'bool')};function renderCommandEntities(){let q=cmdSearch.value.trim().toLowerCase(),shown=allEntities.filter(x=>commandChoices(x.entity_id).length&&(!q||x.entity_id.toLowerCase().includes(q)||x.name.toLowerCase().includes(q)));cmdEntity.innerHTML=shown.map(x=>`<option value="${esc(x.entity_id)}">${esc(x.name)} — ${esc(x.entity_id)} (${esc(x.state)})</option>`).join('')||'<option value="">No compatible entities match</option>';cmdEntityCount.textContent=`${shown.length} compatible entities`;chooseCommandEntity()}
+function commandPayload(){let n=x=>x.value===''?null:Number(x.value),choice=cmdAction.selectedOptions[0];return {entity_id:cmdEntity.value,name:cmdName.value,member_name:cmdMember.value,kind:choice?.dataset.kind,action:cmdAction.value,fixed_value:choice?.dataset.fixed||null,byte_offset:Number(cmdByte.value),min_value:n(cmdMin),max_value:n(cmdMax),risk_tier:Number(cmdTier.value)}}
 cmdSearch.oninput=renderCommandEntities;cmdEntity.onchange=chooseCommandEntity;cmdAction.onchange=()=>{cmdByte.value=nextCommandByte(cmdAction.selectedOptions[0]?.dataset.kind||'bool')};commandArm.onclick=async()=>{let on=commandArm.textContent.includes('Arm command runtime');if(!confirm(`${on?'Arm':'Disarm'} the global command runtime?`))return;try{await j('api/commands/arm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:on})});load().then(renderCommandEntities)}catch(e){say(e.message)}};
 setTimeout(()=>{renderCommandEntities();j('api/status').then(s=>{commandArmState.textContent=s.plc.commands_enabled?'Global command arm: ON':'Global command arm: OFF';commandArm.textContent=s.plc.commands_enabled?'Disarm all commands':'Arm command runtime'}).catch(()=>{})},250);
 </script></body>''')
