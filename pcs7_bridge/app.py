@@ -347,7 +347,7 @@ def status() -> dict[str, Any]:
 
 
 @app.get("/api/states")
-async def get_states() -> list[dict[str, str]]:
+async def get_states() -> list[dict[str, Any]]:
     try:
         raw = await ha_states()
     except httpx.HTTPError as exc:
