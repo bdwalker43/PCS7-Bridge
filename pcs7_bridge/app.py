@@ -83,6 +83,12 @@ def state() -> dict[str, Any]:
         if not saved.get("commands") and COMMAND_MAP_FILE.exists():
             command_map = read_json(COMMAND_MAP_FILE, {})
             saved["commands"] = command_map.get("commands", [])
+        # Backfill older bridge state: an active point is no longer pending
+        # engineering. This keeps the dashboard state honest after upgrades.
+        active_ids = {point.get("point_id") for point in saved.get("points", [])
+                      if point.get("enabled")}
+        saved["pending"] = [item for item in saved.get("pending", [])
+                            if item.get("point_id") not in active_ids]
         return saved
     # The seeded engineering map is read-only until the first local change.
     # It reserves all generated DB59/DB60 addresses so a new point cannot be
@@ -555,6 +561,10 @@ def activate_point(point_id: str) -> dict[str, Any]:
     for point in current["points"]:
         if point["point_id"] == point_id:
             point["enabled"] = True
+            # Activation is the operator's confirmation that the DB/CFC side
+            # is live. It must also complete the local engineering checklist.
+            current["pending"] = [item for item in current.get("pending", [])
+                                  if item.get("point_id") != point_id]
             save(current)
             return point
     raise HTTPException(404, "Point not found.")
@@ -631,6 +641,14 @@ async function load(){let[s,p,e,c]=await Promise.all([j('api/status'),j('api/poi
 function payload(){return {entity_id:entity.value,name:displayName.value,member_name:member.value,kind:kind.value,unit:unit.value,stale_after_s:Number(stale.value)}};function commandPayload(){let n=x=>x.value===''?null:Number(x.value);return {entity_id:cmdEntity.value,name:cmdName.value,member_name:cmdMember.value,kind:cmdKind.value,action:cmdAction.value,byte_offset:Number(cmdByte.value),min_value:n(cmdMin),max_value:n(cmdMax),risk_tier:Number(cmdTier.value)}};async function removeCommand(id){if(!confirm(`Remove ${id}? This does not modify DB58.`))return;try{let x=await j(`api/commands/${id}`,{method:'DELETE'});say(x.detail);load()}catch(e){say(e.message)}}async function activateCommand(id){if(!confirm(`Activate ${id}? Its first live value will be baselined; it will not execute until a later valid change.`))return;try{let x=await j(`api/commands/${id}/activate`,{method:'POST'});say(`${x.command_id} is active.`);load()}catch(e){say(e.message)}};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});document.querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>{if(sortKey===b.dataset.sort)sortDirection*=-1;else{sortKey=b.dataset.sort;sortDirection=1}renderPoints()});entitySearch.oninput=renderEntities;mapSearch.oninput=renderPoints;entity.onchange=chooseEntity;async function removePoint(id){if(!confirm(`Remove ${id} from this bridge map? Its PCS 7 address remains reserved.`))return;try{let x=await j(`api/points/${id}`,{method:'DELETE'});say(x.detail);load()}catch(e){say(e.message)}}async function activatePoint(id){if(!confirm(`Activate ${id}? Only do this after its PCS 7 engineering is live.`))return;try{let x=await j(`api/points/${id}/activate`,{method:'POST'});say(`${x.point_id} is active.`);load()}catch(e){say(e.message)}}resetPoints.onclick=async()=>{if(!confirm('Clear every bridge mapping and pending deployment? This does not alter PCS 7.'))return;try{let x=await j('api/points/reset',{method:'POST'});say(x.detail);load()}catch(e){say(e.message)}};preview.onclick=async()=>{try{let x=await j('api/points/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Preview\n${x.point_id}: ${x.entity_id}\nDB${x.db_number}.${x.member_name} at byte ${x.byte_offset}; quality byte ${x.quality_byte_offset}\nNo change has been saved.`)}catch(e){say(e.message)}};addForm.onsubmit=async e=>{e.preventDefault();try{let x=await j('api/points',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Added ${x.point_id} as a pending deployment. It is not enabled and cannot write to the PLC.`);load()}catch(e){say(e.message)}};cmdPreview.onclick=async()=>{try{let x=await j('api/commands/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(commandPayload())});say(`Command preview\n${x.command_id}: DB58.${x.member_name} at byte ${x.byte_offset}\nNo change has been saved.`)}catch(e){say(e.message)}};commandForm.onsubmit=async e=>{e.preventDefault();try{let x=await j('api/commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(commandPayload())});say(`Added ${x.command_id} as pending. It cannot execute until you explicitly activate it.`);load()}catch(e){say(e.message)}};probe.onclick=async()=>{try{let x=await j('api/probe',{method:'POST'});say(x.detail);load()}catch(e){say(e.message)}};load();</script></body></html>'''
 
 
+UI = UI.replace('<p class="sub">One controlled map between Home Assistant and PCS 7. PLC writes remain disabled until a reviewed cutover.</p>', '<p class="sub">Live Home Assistant ↔ PCS 7 bridge</p>')
+UI = UI.replace('<p class="muted">Activate a point only after its PCS 7 DB/CFC engineering is live and PLC writes have been armed in the app settings. Removing a point only removes it from this bridge map; it does not modify PCS 7.</p>', '')
+UI = UI.replace('Start over — clear all bridge mappings', 'Clear bridge map')
+UI = UI.replace('Add as pending deployment', 'Add input')
+UI = UI.replace('<p class="muted">Each command is a named DB58 CFC signal. The bridge allocates the next DB58 slot, baselines it at startup, and cannot replay it after a restart.</p>', '')
+UI = UI.replace('<p class="muted">The global arm and the individual command activation must both be on before an action can execute.</p>', '')
+UI = UI.replace('<p class="muted">This is allocated automatically. Add the member to DB58 at this address; do not reuse or edit it.</p>', '')
+UI = UI.replace('<p class="muted">This opens then closes one S7 session. It does not read or write a PLC DB.</p>', '')
 UI = UI.replace("</body>", r'''<script>
 function commandPayload(){let n=x=>x.value===''?null:Number(x.value),choice=cmdAction.selectedOptions[0];return {entity_id:cmdEntity.value,name:cmdName.value,member_name:cmdMember.value,kind:choice?.dataset.kind,action:cmdAction.value,byte_offset:Number(cmdByte.value),min_value:n(cmdMin),max_value:n(cmdMax),risk_tier:Number(cmdTier.value)}}
 cmdSearch.oninput=renderCommandEntities;cmdEntity.onchange=chooseCommandEntity;cmdAction.onchange=()=>{cmdByte.value=nextCommandByte(cmdAction.selectedOptions[0]?.dataset.kind||'bool')};commandArm.onclick=async()=>{let on=commandArm.textContent.includes('Arm command runtime');if(!confirm(`${on?'Arm':'Disarm'} the global command runtime?`))return;try{await j('api/commands/arm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:on})});load().then(renderCommandEntities)}catch(e){say(e.message)}};
