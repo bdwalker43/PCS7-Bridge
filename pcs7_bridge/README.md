@@ -11,7 +11,10 @@ panel. Its persistent map lives in the app's `/data/pcs7-bridge.json`.
 - `write_enabled` defaults to `false`. When it is explicitly armed *and* a
   point is explicitly activated after PCS 7 engineering, the app polls the HA
   Core API and writes only that typed allow-list to the assigned DB address.
-- PLC-to-HA commands remain unimplemented and disabled in this first release.
+- PLC-to-HA commands are explicit DB58 allow-list mappings. Each mapping must
+  be engineered in PCS 7, then individually activated in the UI. The runtime
+  baselines values after start/reconfiguration and executes only later valid
+  value changes (or a clean pulse edge).
 - Existing PCS 7 DBs are append-only. The UI never creates, replaces, compiles
   or downloads a DB/CFC project.
 

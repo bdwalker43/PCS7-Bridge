@@ -109,6 +109,20 @@ class PointRequest(BaseModel):
     unit: str = Field(default="", max_length=20)
 
 
+class CommandRequest(BaseModel):
+    """One explicit DB58 CFC-signal command mapping."""
+    entity_id: str = Field(pattern=r"^[a-z_]+\.[a-z0-9_]+$")
+    name: str = Field(min_length=3, max_length=80)
+    member_name: str = Field(pattern=r"^[A-Z][A-Z0-9_]{2,38}$")
+    kind: str = Field(pattern=r"^(bool|pulse|real)$")
+    action: str = Field(pattern=r"^(power|activate|set_value|set_temperature|percentage|brightness_pct)$")
+    byte_offset: int = Field(ge=16, le=65530)
+    min_value: float | None = None
+    max_value: float | None = None
+    fixed_value: str | None = None
+    risk_tier: int = Field(default=1, ge=1, le=3)
+
+
 def next_address(current: list[dict[str, Any]], kind: str) -> tuple[int, int]:
     db = 60 if kind == "real" else 59
     members = [p for p in current if p.get("db_number") == db]
@@ -320,6 +334,7 @@ def status() -> dict[str, Any]:
         "points": len(active_points),
         "removed": len(current["points"]) - len(active_points),
         "pending": len(current["pending"]),
+        "commands": len(current.get("commands", [])),
         "last_probe": current.get("last_probe"),
         "runtime": runtime.copy(),
     }
@@ -347,6 +362,83 @@ def get_commands() -> list[dict[str, Any]]:
     return state().get("commands", [])
 
 
+def proposed_command(request: CommandRequest, commands: list[dict[str, Any]]) -> dict[str, Any]:
+    if request.byte_offset % 2:
+        raise HTTPException(422, "DB58 command byte offset must be even.")
+    if request.kind in {"bool", "pulse"} and request.action not in {"power", "activate"}:
+        raise HTTPException(422, "BOOL/pulse commands require power or activate.")
+    if request.kind == "real" and request.action not in {"set_value", "set_temperature", "percentage", "brightness_pct"}:
+        raise HTTPException(422, "REAL commands require a numeric set action.")
+    if request.min_value is not None and request.max_value is not None and request.min_value > request.max_value:
+        raise HTTPException(422, "Minimum cannot exceed maximum.")
+    if any(int(item.get("byte_offset", -1)) == request.byte_offset for item in commands):
+        raise HTTPException(409, "That DB58 byte offset is already mapped.")
+    if any(item.get("member_name") == request.member_name for item in commands):
+        raise HTTPException(409, "That PCS 7 member name is already mapped.")
+    command = {"command_id": f"HC_{len(commands) + 1:03d}", "entity_id": request.entity_id,
+               "name": request.name.strip(), "member_name": request.member_name,
+               "kind": request.kind, "action": request.action,
+               "byte_offset": request.byte_offset, "min_value": request.min_value,
+               "max_value": request.max_value, "fixed_value": request.fixed_value or "",
+               "enabled": False, "risk_tier": request.risk_tier,
+               "created_at": int(time.time())}
+    try:
+        Command.from_dict(command)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return command
+
+
+def persist_commands(commands: list[dict[str, Any]]) -> None:
+    DATA.mkdir(parents=True, exist_ok=True)
+    temporary = COMMAND_MAP_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"commands": commands}, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(COMMAND_MAP_FILE)
+
+
+@app.post("/api/commands/preview")
+def preview_command(request: CommandRequest) -> dict[str, Any]:
+    return proposed_command(request, state().get("commands", []))
+
+
+@app.post("/api/commands")
+def add_command(request: CommandRequest) -> dict[str, Any]:
+    current = state()
+    commands = current.setdefault("commands", [])
+    command = proposed_command(request, commands)
+    commands.append(command)
+    current.setdefault("pending", []).append({"type": "new_command", "command_id": command["command_id"],
+        "created_at": command["created_at"], "status": "needs_pcs7_engineering",
+        "steps": [f"Create {command['member_name']} at DB58 byte {command['byte_offset']}.",
+                  "Compile/download DB58 and connect the CFC signal.",
+                  "Return here and explicitly activate this command after verification."]})
+    persist_commands(commands); save(current)
+    return command
+
+
+@app.post("/api/commands/{command_id}/activate")
+def activate_command(command_id: str) -> dict[str, Any]:
+    current = state()
+    for command in current.get("commands", []):
+        if command.get("command_id") == command_id:
+            command["enabled"] = True
+            persist_commands(current["commands"]); save(current)
+            return command
+    raise HTTPException(404, "Command not found.")
+
+
+@app.delete("/api/commands/{command_id}")
+def remove_command(command_id: str) -> dict[str, Any]:
+    current = state(); commands = current.get("commands", [])
+    kept = [item for item in commands if item.get("command_id") != command_id]
+    if len(kept) == len(commands):
+        raise HTTPException(404, "Command not found.")
+    current["commands"] = kept
+    current["pending"] = [row for row in current.get("pending", []) if row.get("command_id") != command_id]
+    persist_commands(kept); save(current)
+    return {"detail": "Command removed; DB58 itself was not modified."}
+
+
 @app.post("/api/commands/import")
 def import_commands(command_map: dict[str, Any]) -> dict[str, int]:
     """Persist a reviewed DB58 map after validating every typed slot."""
@@ -359,10 +451,7 @@ def import_commands(command_map: dict[str, Any]) -> dict[str, int]:
         raise HTTPException(422, f"Invalid command map: {exc}") from exc
     if len({item.command_id for item in parsed}) != len(parsed):
         raise HTTPException(422, "Command IDs must be unique.")
-    DATA.mkdir(parents=True, exist_ok=True)
-    temporary = COMMAND_MAP_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"commands": commands}, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(COMMAND_MAP_FILE)
+    persist_commands(commands)
     return {"commands": len(parsed)}
 
 
@@ -521,16 +610,16 @@ UI = r'''<!doctype html><html><head><meta name="viewport" content="width=device-
 <nav class="nav"><button class="active" data-tab="add">Add input</button><button data-tab="map">Point map</button><button data-tab="commands">Commands</button><button data-tab="connection">Connection</button></nav>
 <section class="section active" id="add"><h2>Add Home Assistant input</h2><form id="addForm"><label>Find an unmapped Home Assistant entity</label><input id="entitySearch" autocomplete="off" placeholder="Search by name or entity ID"><label>Available entities</label><select id="entity" size="9" required><option value="">Loading Home Assistant entities…</option></select><p class="muted" id="entityCount"></p><label>Display name</label><input id="name" required><label>PCS 7 member name</label><input id="member" required maxlength="24" placeholder="HA_GARAGE_TEMP"><label>Type</label><select id="kind"><option value="real">REAL · DB60</option><option value="bool">BOOL · DB59</option></select><label>Unit (optional)</label><input id="unit" placeholder="°F"><label>Stale after seconds</label><input id="stale" type="number" min="60" value="900"><button type="button" id="preview">Preview mapping</button><button type="submit">Add as pending deployment</button></form></section>
 <section class="section" id="map"><h2>Point map</h2><p class="muted">Activate a point only after its PCS 7 DB/CFC engineering is live and PLC writes have been armed in the app settings. Removing a point only removes it from this bridge map; it does not modify PCS 7.</p><button class="danger" id="resetPoints">Start over — clear all bridge mappings</button><input id="mapSearch" placeholder="Search mapped points"><div class="sort-bar"><button data-sort="name">Name ↕</button><button data-sort="entity_id">Home Assistant ↕</button><button data-sort="pcs7">PCS 7 ↕</button><button data-sort="status">Status ↕</button></div><div class="map-list" id="points"></div></section>
-<section class="section" id="commands"><h2>PCS 7 → Home Assistant commands</h2><p class="muted">DB58 accepts only a reviewed, named command allow-list. The runtime baselines any live PLC values at startup, so a restart cannot replay a command. Global command arming remains off unless separately enabled in app settings.</p><div class="map-list" id="commandsList"></div></section>
+<section class="section" id="commands"><h2>PCS 7 → Home Assistant commands</h2><p class="muted">Each command is a named DB58 CFC signal. It is inert until you activate it; startup values are baselined and cannot replay an action.</p><form id="commandForm"><label>Home Assistant entity ID</label><input id="cmdEntity" required placeholder="input_boolean.bridge_test"><label>Display name</label><input id="cmdName" required placeholder="Bridge test"><label>PCS 7 DB58 member name</label><input id="cmdMember" required placeholder="CMD_TEST"><label>Signal type</label><select id="cmdKind"><option value="pulse">Pulse — runs only on a 0 → 1 edge</option><option value="bool">BOOL — tracks on/off</option><option value="real">REAL — numeric setpoint</option></select><label>Home Assistant action</label><select id="cmdAction"><option value="activate">Activate / press</option><option value="power">Power on / off</option><option value="set_value">Set number value</option><option value="set_temperature">Set climate temperature</option><option value="percentage">Set fan percentage</option><option value="brightness_pct">Set light brightness %</option></select><label>DB58 byte offset</label><input id="cmdByte" type="number" min="16" step="2" value="16" required><div class="map-fields"><div><label>Minimum (REAL only)</label><input id="cmdMin" type="number" step="any"></div><div><label>Maximum (REAL only)</label><input id="cmdMax" type="number" step="any"></div></div><label>Risk tier</label><select id="cmdTier"><option value="1">1 — test/low impact</option><option value="2">2 — controlled device</option><option value="3">3 — high impact</option></select><button type="button" id="cmdPreview">Preview command</button><button type="submit">Add as pending command</button></form><h2 style="margin-top:20px">Command map</h2><div class="map-list" id="commandsList"></div></section>
 <section class="section" id="connection"><h2>Connection test</h2><div class="card"><button class="warn" id="probe">Run one read-only Snap7 connection probe</button><p class="muted">This opens then closes one S7 session. It does not read or write a PLC DB.</p></div></section>
 </main><script>
 const j=(u,o={})=>fetch(u,o).then(async r=>{let x=await r.json();if(!r.ok){let d=x.detail;if(Array.isArray(d))d=d.map(v=>`${(v.loc||[]).slice(1).join('.')||'field'}: ${v.msg}`).join('\n');throw Error(d||r.statusText)}return x});const n=document.querySelector('#notice'),displayName=document.querySelector('#name');let allEntities=[],points=[],commands=[],sortKey='name',sortDirection=1;const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function say(x){n.textContent=x;n.style.display='block'}
 function memberFor(text){return ('HA_'+text.toUpperCase().replace(/[^A-Z0-9]+/g,'_').replace(/^_+|_+$/g,'')).slice(0,24).replace(/_+$/,'')}
 function chooseEntity(){let x=allEntities.find(x=>x.entity_id===entity.value);if(x){if(!displayName.value)displayName.value=x.name;if(!member.value)member.value=memberFor(x.name)}}function renderEntities(){let q=entitySearch.value.trim().toLowerCase(),mapped=new Set(points.filter(x=>!x.removed).map(x=>x.entity_id)),shown=allEntities.filter(x=>!mapped.has(x.entity_id)&&(!q||x.entity_id.toLowerCase().includes(q)||x.name.toLowerCase().includes(q)));entity.innerHTML=shown.map(x=>`<option value="${esc(x.entity_id)}">${esc(x.name)} — ${esc(x.entity_id)} (${esc(x.state)})</option>`).join('')||'<option value="">No unmapped entities match</option>';entityCount.textContent=`${shown.length} available · ${mapped.size} already mapped`;chooseEntity()}
 function pointSortValue(x){if(sortKey==='pcs7')return `${String(x.db_number).padStart(4,'0')}:${String(x.byte_offset).padStart(6,'0')}`;if(sortKey==='status')return x.enabled?'active':x.existing?'existing map':'pending';return String(x[sortKey]||'').toLowerCase()}function renderPoints(){let q=mapSearch.value.trim().toLowerCase(),shown=points.filter(x=>!x.removed&&(!q||[x.name,x.entity_id,x.member_name,x.point_id].join(' ').toLowerCase().includes(q))).sort((a,b)=>pointSortValue(a).localeCompare(pointSortValue(b),undefined,{numeric:true})*sortDirection);document.querySelector('#points').innerHTML=shown.map(x=>`<article class="map-item"><div class="map-fields"><div><div class=label>Name</div><div class=map-value>${esc(x.name)}<br><span class=pill>${esc(x.point_id)}</span></div></div><div><div class=label>Home Assistant</div><div class=map-value>${esc(x.entity_id)}</div></div><div><div class=label>PCS 7</div><div class=map-value>DB${x.db_number} · ${esc(x.member_name)}<br><span class=muted>byte ${x.byte_offset}</span></div></div><div><div class=label>Status</div><div class=map-value>${x.enabled?'Active':x.existing?'Existing map':'Pending'}</div></div></div><div class=map-action>${x.enabled?'':`<button class=warn data-activate="${esc(x.point_id)}">Activate point</button>`}<button class=danger data-remove="${esc(x.point_id)}">Remove mapping</button></div></article>`).join('')||'<div class=empty>No mapped points match.</div>';document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>removePoint(b.dataset.remove));document.querySelectorAll('[data-activate]').forEach(b=>b.onclick=()=>activatePoint(b.dataset.activate));document.querySelectorAll('[data-sort]').forEach(b=>b.textContent=b.dataset.sort==='pcs7'?`PCS 7 ${sortKey==='pcs7'?(sortDirection===1?'↑':'↓'):'↕'}`:`${b.dataset.sort==='entity_id'?'Home Assistant':b.dataset.sort[0].toUpperCase()+b.dataset.sort.slice(1)} ${sortKey===b.dataset.sort?(sortDirection===1?'↑':'↓'):'↕'}`)}
-function renderCommands(){document.querySelector('#commandsList').innerHTML=commands.map(x=>`<article class=map-item><div class=map-fields><div><div class=label>Command</div><div class=map-value>${esc(x.command_id)}</div></div><div><div class=label>Home Assistant</div><div class=map-value>${esc(x.entity_id)}</div></div><div><div class=label>Action</div><div class=map-value>${esc(x.action)} · ${esc(x.kind)}</div></div><div><div class=label>Safety</div><div class=map-value>${x.enabled?'Mapped':'Disabled'} · Tier ${esc(x.risk_tier)}</div></div></div></article>`).join('')||'<div class=empty>No reviewed DB58 commands are loaded. The command runtime cannot issue any Home Assistant actions.</div>'}
-async function load(){let[s,p,e,c]=await Promise.all([j('api/status'),j('api/points'),j('api/states').catch(()=>[]),j('api/commands')]);points=p;allEntities=e;commands=c;document.querySelector('#status').innerHTML=`<div class=card><div class=label>PLC endpoint</div><strong>${s.plc.plc_host} · R${s.plc.rack}/S${s.plc.slot}</strong></div><div class=card><div class=label>Mapped points</div><strong>${s.points}</strong></div><div class=card><div class=label>Pending engineering</div><strong>${s.pending}</strong></div><div class=card><div class=label>PLC writes</div><strong>${s.plc.write_enabled?'ARMED':'DISABLED'}</strong></div>`;renderEntities();renderPoints();renderCommands()}
-function payload(){return {entity_id:entity.value,name:displayName.value,member_name:member.value,kind:kind.value,unit:unit.value,stale_after_s:Number(stale.value)}};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});document.querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>{if(sortKey===b.dataset.sort)sortDirection*=-1;else{sortKey=b.dataset.sort;sortDirection=1}renderPoints()});entitySearch.oninput=renderEntities;mapSearch.oninput=renderPoints;entity.onchange=chooseEntity;async function removePoint(id){if(!confirm(`Remove ${id} from this bridge map? Its PCS 7 address remains reserved.`))return;try{let x=await j(`api/points/${id}`,{method:'DELETE'});say(x.detail);load()}catch(e){say(e.message)}}async function activatePoint(id){if(!confirm(`Activate ${id}? Only do this after its PCS 7 engineering is live.`))return;try{let x=await j(`api/points/${id}/activate`,{method:'POST'});say(`${x.point_id} is active.`);load()}catch(e){say(e.message)}}resetPoints.onclick=async()=>{if(!confirm('Clear every bridge mapping and pending deployment? This does not alter PCS 7.'))return;try{let x=await j('api/points/reset',{method:'POST'});say(x.detail);load()}catch(e){say(e.message)}};preview.onclick=async()=>{try{let x=await j('api/points/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Preview\n${x.point_id}: ${x.entity_id}\nDB${x.db_number}.${x.member_name} at byte ${x.byte_offset}; quality byte ${x.quality_byte_offset}\nNo change has been saved.`)}catch(e){say(e.message)}};addForm.onsubmit=async e=>{e.preventDefault();try{let x=await j('api/points',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Added ${x.point_id} as a pending deployment. It is not enabled and cannot write to the PLC.`);load()}catch(e){say(e.message)}};probe.onclick=async()=>{try{let x=await j('api/probe',{method:'POST'});say(x.detail);load()}catch(e){say(e.message)}};load();</script></body></html>'''
+function renderCommands(){document.querySelector('#commandsList').innerHTML=commands.map(x=>`<article class=map-item><div class=map-fields><div><div class=label>Command</div><div class=map-value>${esc(x.name)}<br><span class=pill>${esc(x.command_id)}</span></div></div><div><div class=label>Home Assistant</div><div class=map-value>${esc(x.entity_id)} · ${esc(x.action)}</div></div><div><div class=label>PCS 7</div><div class=map-value>DB58 · ${esc(x.member_name)}<br><span class=muted>byte ${esc(x.byte_offset)}</span></div></div><div><div class=label>Safety</div><div class=map-value>${x.enabled?'Active':'Pending'} · Tier ${esc(x.risk_tier)}</div></div></div><div class=map-action>${x.enabled?'':`<button class=warn data-cmd-activate="${esc(x.command_id)}">Activate command</button>`}<button class=danger data-cmd-remove="${esc(x.command_id)}">Remove command</button></div></article>`).join('')||'<div class=empty>No commands are mapped.</div>';document.querySelectorAll('[data-cmd-activate]').forEach(b=>b.onclick=()=>activateCommand(b.dataset.cmdActivate));document.querySelectorAll('[data-cmd-remove]').forEach(b=>b.onclick=()=>removeCommand(b.dataset.cmdRemove))}
+async function load(){let[s,p,e,c]=await Promise.all([j('api/status'),j('api/points'),j('api/states').catch(()=>[]),j('api/commands')]);points=p;allEntities=e;commands=c;document.querySelector('#status').innerHTML=`<div class=card><div class=label>PLC endpoint</div><strong>${s.plc.plc_host} · R${s.plc.rack}/S${s.plc.slot}</strong></div><div class=card><div class=label>Mapped points</div><strong>${s.points}</strong></div><div class=card><div class=label>Commands</div><strong>${s.commands} · ${s.plc.commands_enabled?'ARMED':'DISABLED'}</strong></div><div class=card><div class=label>PLC writes</div><strong>${s.plc.write_enabled?'ARMED':'DISABLED'}</strong></div>`;renderEntities();renderPoints();renderCommands()}
+function payload(){return {entity_id:entity.value,name:displayName.value,member_name:member.value,kind:kind.value,unit:unit.value,stale_after_s:Number(stale.value)}};function commandPayload(){let n=x=>x.value===''?null:Number(x.value);return {entity_id:cmdEntity.value,name:cmdName.value,member_name:cmdMember.value,kind:cmdKind.value,action:cmdAction.value,byte_offset:Number(cmdByte.value),min_value:n(cmdMin),max_value:n(cmdMax),risk_tier:Number(cmdTier.value)}};async function removeCommand(id){if(!confirm(`Remove ${id}? This does not modify DB58.`))return;try{let x=await j(`api/commands/${id}`,{method:'DELETE'});say(x.detail);load()}catch(e){say(e.message)}}async function activateCommand(id){if(!confirm(`Activate ${id}? Its first live value will be baselined; it will not execute until a later valid change.`))return;try{let x=await j(`api/commands/${id}/activate`,{method:'POST'});say(`${x.command_id} is active.`);load()}catch(e){say(e.message)}};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===b.dataset.tab))});document.querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>{if(sortKey===b.dataset.sort)sortDirection*=-1;else{sortKey=b.dataset.sort;sortDirection=1}renderPoints()});entitySearch.oninput=renderEntities;mapSearch.oninput=renderPoints;entity.onchange=chooseEntity;async function removePoint(id){if(!confirm(`Remove ${id} from this bridge map? Its PCS 7 address remains reserved.`))return;try{let x=await j(`api/points/${id}`,{method:'DELETE'});say(x.detail);load()}catch(e){say(e.message)}}async function activatePoint(id){if(!confirm(`Activate ${id}? Only do this after its PCS 7 engineering is live.`))return;try{let x=await j(`api/points/${id}/activate`,{method:'POST'});say(`${x.point_id} is active.`);load()}catch(e){say(e.message)}}resetPoints.onclick=async()=>{if(!confirm('Clear every bridge mapping and pending deployment? This does not alter PCS 7.'))return;try{let x=await j('api/points/reset',{method:'POST'});say(x.detail);load()}catch(e){say(e.message)}};preview.onclick=async()=>{try{let x=await j('api/points/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Preview\n${x.point_id}: ${x.entity_id}\nDB${x.db_number}.${x.member_name} at byte ${x.byte_offset}; quality byte ${x.quality_byte_offset}\nNo change has been saved.`)}catch(e){say(e.message)}};addForm.onsubmit=async e=>{e.preventDefault();try{let x=await j('api/points',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});say(`Added ${x.point_id} as a pending deployment. It is not enabled and cannot write to the PLC.`);load()}catch(e){say(e.message)}};cmdPreview.onclick=async()=>{try{let x=await j('api/commands/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(commandPayload())});say(`Command preview\n${x.command_id}: DB58.${x.member_name} at byte ${x.byte_offset}\nNo change has been saved.`)}catch(e){say(e.message)}};commandForm.onsubmit=async e=>{e.preventDefault();try{let x=await j('api/commands',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(commandPayload())});say(`Added ${x.command_id} as pending. It cannot execute until you explicitly activate it.`);load()}catch(e){say(e.message)}};probe.onclick=async()=>{try{let x=await j('api/probe',{method:'POST'});say(x.detail);load()}catch(e){say(e.message)}};load();</script></body></html>'''
 
 
 @app.get("/", response_class=HTMLResponse)
