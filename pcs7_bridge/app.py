@@ -387,15 +387,23 @@ def proposed_command(request: CommandRequest, commands: list[dict[str, Any]]) ->
         raise HTTPException(422, "BOOL/pulse commands require a supported switching action.")
     if request.kind == "real" and request.action not in {"set_value", "set_temperature", "percentage", "brightness_pct"}:
         raise HTTPException(422, "REAL commands require a numeric set action.")
-    if request.min_value is not None and request.max_value is not None and request.min_value > request.max_value:
+    min_value, max_value = request.min_value, request.max_value
+    if request.action == "brightness_pct":
+        if request.entity_id.split(".", 1)[0] != "light" or request.kind != "real":
+            raise HTTPException(422, "brightness_pct requires a REAL light command.")
+        min_value = 0 if min_value is None else min_value
+        max_value = 100 if max_value is None else max_value
+        if min_value != 0 or max_value != 100:
+            raise HTTPException(422, "brightness_pct is fixed at 0 through 100 percent.")
+    if min_value is not None and max_value is not None and min_value > max_value:
         raise HTTPException(422, "Minimum cannot exceed maximum.")
     if any(item.get("member_name") == request.member_name for item in commands):
         raise HTTPException(409, "That PCS 7 member name is already mapped.")
     command = {"command_id": f"HC_{len(commands) + 1:03d}", "entity_id": request.entity_id,
                "name": request.name.strip(), "member_name": request.member_name,
                "kind": request.kind, "action": request.action,
-               "byte_offset": byte_offset, "min_value": request.min_value,
-               "max_value": request.max_value, "fixed_value": request.fixed_value or "",
+               "byte_offset": byte_offset, "min_value": min_value,
+               "max_value": max_value, "fixed_value": request.fixed_value or "",
                "enabled": False, "risk_tier": request.risk_tier,
                "created_at": int(time.time())}
     try:

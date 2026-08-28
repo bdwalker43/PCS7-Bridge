@@ -59,6 +59,11 @@ class Command:
             raise ValueError("invalid DB58 command offset")
         if command.risk_tier not in {1, 2, 3}:
             raise ValueError("invalid command risk tier")
+        if command.action == "brightness_pct":
+            if command.entity_id.split(".", 1)[0] != "light" or command.kind != "real":
+                raise ValueError("brightness_pct requires a REAL light command")
+            if command.min_value != 0 or command.max_value != 100:
+                raise ValueError("brightness_pct range must be 0 through 100")
         return command
 
     @property
